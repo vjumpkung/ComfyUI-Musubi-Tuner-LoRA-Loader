@@ -20,7 +20,7 @@ A ComfyUI custom node that enables direct loading of musubi-tuner based LoRAs (Z
 
 2. Clone this repository:
    ```bash
-   git clone https://github.com/your-username/ComfyUI-Musubi-Tuner-LoRA-Loader.git
+   git clone https://github.com/vjumpkung/ComfyUI-Musubi-Tuner-LoRA-Loader.git
    ```
 
 3. Restart ComfyUI or reload custom nodes

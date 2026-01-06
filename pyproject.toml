@@ -1,7 +1,7 @@
 [project]
 name = "musubi-tuner-lora-loader"
 description = "A ComfyUI custom node that enables direct loading of musubi-tuner based LoRAs (Z-Image Turbo, Hunyuan Video 1.5) with automatic in-memory conversion and caching."
-version = "1.0.0"
+version = "1.0.1"
 license = {file = "LICENSE"} 
 # classifiers = [
 #     # For OS-independent nodes (works on all operating systems)

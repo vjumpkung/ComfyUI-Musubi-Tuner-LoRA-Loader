@@ -28,7 +28,7 @@ Documentation = "https://github.com/vjumpkung/ComfyUI-Musubi-Tuner-LoRA-Loader/w
 "Bug Tracker" = "https://github.com/vjumpkung/ComfyUI-Musubi-Tuner-LoRA-Loader/issues"
 
 [tool.comfy]
-PublisherId = ""
+PublisherId = "vjumpkung"
 DisplayName = "ComfyUI-Musubi-Tuner-LoRA-Loader"
 Icon = ""
 includes = [] 

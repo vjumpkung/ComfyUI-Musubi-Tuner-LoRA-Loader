@@ -2,8 +2,8 @@ import logging
 
 logging.info("Importing... Musubi-Tuner LoRA Loader 🔃")
 
-from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
-
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+from .nodes import comfy_entrypoint
 
 logging.info("Importing Musubi-Tuner LoRA Loader Completed 🎉")
+
+__all__ = ["comfy_entrypoint"]

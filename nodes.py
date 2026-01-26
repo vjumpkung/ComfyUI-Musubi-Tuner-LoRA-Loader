@@ -11,6 +11,136 @@ from comfy_api.latest import ComfyExtension, io
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+"""
+- This node is loading and coverting musubi-tuner based LoRA like Z-Image Turbo and Hunyuan Video 1.5
+    without create new file and ready to use in ComfyUI.
+    by converting before load into ComfyUI.
+- Credits : https://github.com/kohya-ss/musubi-tuner/blob/main/src/musubi_tuner/convert_lora.py
+"""
+
+# keys of Qwen-Image state dict
+QWEN_IMAGE_KEYS = [
+    "time_text_embed.timestep_embedder.linear_1",
+    "time_text_embed.timestep_embedder.linear_2",
+    "txt_norm",
+    "img_in",
+    "txt_in",
+    "transformer_blocks.*.img_mod.1",
+    "transformer_blocks.*.attn.norm_q",
+    "transformer_blocks.*.attn.norm_k",
+    "transformer_blocks.*.attn.to_q",
+    "transformer_blocks.*.attn.to_k",
+    "transformer_blocks.*.attn.to_v",
+    "transformer_blocks.*.attn.add_k_proj",
+    "transformer_blocks.*.attn.add_v_proj",
+    "transformer_blocks.*.attn.add_q_proj",
+    "transformer_blocks.*.attn.to_out.0",
+    "transformer_blocks.*.attn.to_add_out",
+    "transformer_blocks.*.attn.norm_added_q",
+    "transformer_blocks.*.attn.norm_added_k",
+    "transformer_blocks.*.img_mlp.net.0.proj",
+    "transformer_blocks.*.img_mlp.net.2",
+    "transformer_blocks.*.txt_mod.1",
+    "transformer_blocks.*.txt_mlp.net.0.proj",
+    "transformer_blocks.*.txt_mlp.net.2",
+    "norm_out.linear",
+    "proj_out",
+]
+
+
+def convert_to_diffusers(prefix, diffusers_prefix, weights_sd):
+    # convert from default LoRA to diffusers
+    if diffusers_prefix is None:
+        diffusers_prefix = "diffusion_model"
+
+    # make reverse map from LoRA name to base model module name
+    lora_name_to_module_name = {}
+    for key in QWEN_IMAGE_KEYS:
+        if "*" not in key:
+            lora_name = prefix + key.replace(".", "_")
+            lora_name_to_module_name[lora_name] = key
+        else:
+            lora_name = prefix + key.replace(".", "_")
+            for i in range(100):  # assume at most 100 transformer blocks
+                lora_name_to_module_name[lora_name.replace("*", str(i))] = key.replace(
+                    "*", str(i)
+                )
+
+    # get alphas
+    lora_alphas = {}
+    for key, weight in weights_sd.items():
+        if key.startswith(prefix):
+            lora_name = key.split(".", 1)[0]  # before first dot
+            if lora_name not in lora_alphas and "alpha" in key:
+                lora_alphas[lora_name] = weight
+
+    new_weights_sd = {}
+    for key, weight in tqdm(weights_sd.items(), desc="Processing QKV layers"):
+        if key.startswith(prefix):
+            if "alpha" in key:
+                continue
+
+            lora_name = key.split(".", 1)[0]  # before first dot
+
+            if lora_name in lora_name_to_module_name:
+                module_name = lora_name_to_module_name[lora_name]
+            else:
+                module_name = lora_name[len(prefix) :]  # remove "lora_unet_"
+                module_name = module_name.replace("_", ".")  # replace "_" with "."
+                if ".cross.attn." in module_name or ".self.attn." in module_name:
+                    # Wan2.1 lora name to module name: ugly but works
+                    module_name = module_name.replace(
+                        "cross.attn", "cross_attn"
+                    )  # fix cross attn
+                    module_name = module_name.replace(
+                        "self.attn", "self_attn"
+                    )  # fix self attn
+                    module_name = module_name.replace("k.img", "k_img")  # fix k img
+                    module_name = module_name.replace("v.img", "v_img")  # fix v img
+                elif ".attention.to." in module_name or ".feed.forward." in module_name:
+                    # Z-Image lora name to module name: ugly but works
+                    module_name = module_name.replace("to.q", "to_q")  # fix to q
+                    module_name = module_name.replace("to.k", "to_k")  # fix to k
+                    module_name = module_name.replace("to.v", "to_v")  # fix to v
+                    module_name = module_name.replace("to.out", "to_out")  # fix to out
+                    module_name = module_name.replace(
+                        "feed.forward", "feed_forward"
+                    )  # fix feed forward
+                elif "double.blocks." in module_name or "single.blocks." in module_name:
+                    # HunyuanVideo and FLUX lora name to module name: ugly but works
+                    module_name = module_name.replace(
+                        "double.blocks.", "double_blocks."
+                    )  # fix double blocks
+                    module_name = module_name.replace(
+                        "single.blocks.", "single_blocks."
+                    )  # fix single blocks
+                    module_name = module_name.replace("img.", "img_")  # fix img
+                    module_name = module_name.replace("txt.", "txt_")  # fix txt
+                    module_name = module_name.replace("attn.", "attn_")  # fix attn
+
+            if "lora_down" in key:
+                new_key = f"{diffusers_prefix}.{module_name}.lora_A.weight"
+                dim = weight.shape[0]
+            elif "lora_up" in key:
+                new_key = f"{diffusers_prefix}.{module_name}.lora_B.weight"
+                dim = weight.shape[1]
+            else:
+                logger.warning(f"unexpected key: {key} in default LoRA format")
+                continue
+
+            # scale weight by alpha
+            if lora_name in lora_alphas:
+                # we scale both down and up, so scale is sqrt
+                scale = lora_alphas[lora_name] / dim
+                scale = scale.sqrt()
+                weight = weight * scale
+            else:
+                logger.warning(f"missing alpha for {lora_name}")
+
+            new_weights_sd[new_key] = weight
+
+    return new_weights_sd
+
 
 class MusubiTunerLoRALoaderModelOnly(io.ComfyNode):
     @classmethod
@@ -36,209 +166,20 @@ class MusubiTunerLoRALoaderModelOnly(io.ComfyNode):
 
     @classmethod
     def execute(self, model, lora_name, strength_model):
-        """
-        - This node is loading and coverting musubi-tuner based LoRA like Z-Image Turbo and Hunyuan Video 1.5
-          without create new file and ready to use in ComfyUI.
-          by converting before load into ComfyUI.
-        - Credits : https://github.com/kohya-ss/musubi-tuner/blob/main/src/musubi_tuner/networks/lora_zimage.py
-        """
         if strength_model == 0:
             return io.NodeOutput(
                 model,
             )
 
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
-        lora = None
-
-        if lora is None:
-            logger.info(
-                "Start Converting Musubi Tuner LoRA to ComfyUI Compatible Format..."
-            )
-
-            state_dict = comfy.utils.load_torch_file(lora_path, safe_load=True)
-
-            keys = list(state_dict.keys())
-            count = 0
-
-            # for musubi-tuner z-image lora
-            blocks_mappings = [
-                ("attention_to_out_0", "attention_out"),
-                ("attention_norm_k", "attention_k_norm"),
-                ("attention_norm_q", "attention_q_norm"),
-            ]
-
-            # for musubi-tuner hunyuan video 1.5 lora
-            double_blocks_mappings = [
-                ("img_mlp_fc1", "img_mlp_0"),
-                ("img_mlp_fc2", "img_mlp_2"),
-                ("img_mod_linear", "img_mod_lin"),
-                ("txt_mlp_fc1", "txt_mlp_0"),
-                ("txt_mlp_fc2", "txt_mlp_2"),
-                ("txt_mod_linear", "txt_mod_lin"),
-            ]
-
-            for key in keys:
-                new_k = key
-
-                if "layers" in key:
-                    mappings = blocks_mappings
-                elif "double_blocks" in key:
-                    mappings = double_blocks_mappings
-                else:
-                    continue
-
-                # Apply mappings based on conversion direction
-                for src_key, dst_key in mappings:
-                    new_k = new_k.replace(src_key, dst_key)
-
-                if new_k != key:
-                    state_dict[new_k] = state_dict.pop(key)
-                    count += 1
-                    # print(f"Renamed {key} to {new_k}")
-
-            # sd-scripts to ComfyUI: concat QKV
-            qkv_count = 0
-            keys = list(state_dict.keys())
-            for key in tqdm(keys, desc="Processing QKV layers"):
-                # for z-image turbo
-                if "attention" in key and (
-                    "to_q" in key or "to_k" in key or "to_v" in key
-                ):
-                    if (
-                        "to_q" not in key or "lora_up" not in key
-                    ):  # ensure we process only once per QKV set
-                        continue
-
-                    lora_name = key.split(".", 1)[0]  # get LoRA base name
-                    split_dims = [
-                        state_dict[key].size(0)
-                    ] * 3  # assume equal split for Q, K, V
-
-                    lora_name_prefix = lora_name.replace("to_q", "")
-                    down_weights = []  # (rank, in_dim) * 3
-                    up_weights = []  # (split dim, rank) * 3
-                    for weight_index in range(len(split_dims)):
-                        if weight_index == 0:
-                            suffix = "to_q"
-                        elif weight_index == 1:
-                            suffix = "to_k"
-                        else:
-                            suffix = "to_v"
-                        down_weights.append(
-                            state_dict.pop(
-                                f"{lora_name_prefix}{suffix}.lora_down.weight"
-                            )
-                        )
-                        up_weights.append(
-                            state_dict.pop(f"{lora_name_prefix}{suffix}.lora_up.weight")
-                        )
-
-                    alpha = state_dict.pop(f"{lora_name}.alpha")
-                    state_dict.pop(f"{lora_name_prefix}to_k.alpha")
-                    state_dict.pop(f"{lora_name_prefix}to_v.alpha")
-
-                    # merge down weight
-                    down_weight = torch.cat(
-                        down_weights, dim=0
-                    )  # (rank, split_dim) * 3 -> (rank*3, sum of split_dim)
-
-                    # merge up weight (sum of split_dim, rank*3), dense to sparse
-                    rank = up_weights[0].size(1)
-                    up_weight = torch.zeros(
-                        (sum(split_dims), down_weight.size(0)),
-                        device=down_weight.device,
-                        dtype=down_weight.dtype,
-                    )
-                    weight_index = 0
-                    for i in range(len(split_dims)):
-                        up_weight[
-                            weight_index : weight_index + split_dims[i],
-                            i * rank : (i + 1) * rank,
-                        ] = up_weights[i]
-                        weight_index += split_dims[i]
-
-                    new_lora_name = lora_name_prefix + "qkv"
-                    state_dict[f"{new_lora_name}.lora_down.weight"] = down_weight
-                    state_dict[f"{new_lora_name}.lora_up.weight"] = up_weight
-
-                    # adjust alpha because rank is 3x larger. See https://github.com/kohya-ss/sd-scripts/issues/2204
-                    state_dict[f"{new_lora_name}.alpha"] = alpha * 3
-                    qkv_count += 1
-
-                # for hunyuan video 1.5
-                elif ("img_attn" in key or "txt_attn" in key) and (
-                    "_q" in key or "_k" in key or "_v" in key
-                ):
-                    if (
-                        "_q" not in key or "lora_up" not in key
-                    ):  # ensure we process only once per QKV set
-                        continue
-
-                    lora_name = key.split(".", 1)[0]  # get LoRA base name
-                    split_dims = [
-                        state_dict[key].size(0)
-                    ] * 3  # assume equal split for Q, K, V
-
-                    lora_name_prefix = lora_name.replace("_q", "")
-                    down_weights = []  # (rank, in_dim) * 3
-                    up_weights = []  # (split dim, rank) * 3
-                    for weight_index in range(len(split_dims)):
-                        if weight_index == 0:
-                            suffix = "_q"
-                        elif weight_index == 1:
-                            suffix = "_k"
-                        else:
-                            suffix = "_v"
-                        down_weights.append(
-                            state_dict.pop(
-                                f"{lora_name_prefix}{suffix}.lora_down.weight"
-                            )
-                        )
-                        up_weights.append(
-                            state_dict.pop(f"{lora_name_prefix}{suffix}.lora_up.weight")
-                        )
-
-                    alpha = state_dict.pop(f"{lora_name}.alpha")
-                    state_dict.pop(f"{lora_name_prefix}_k.alpha")
-                    state_dict.pop(f"{lora_name_prefix}_v.alpha")
-
-                    # merge down weight
-                    down_weight = torch.cat(
-                        down_weights, dim=0
-                    )  # (rank, split_dim) * 3 -> (rank*3, sum of split_dim)
-
-                    # merge up weight (sum of split_dim, rank*3), dense to sparse
-                    rank = up_weights[0].size(1)
-                    up_weight = torch.zeros(
-                        (sum(split_dims), down_weight.size(0)),
-                        device=down_weight.device,
-                        dtype=down_weight.dtype,
-                    )
-                    weight_index = 0
-                    for i in range(len(split_dims)):
-                        up_weight[
-                            weight_index : weight_index + split_dims[i],
-                            i * rank : (i + 1) * rank,
-                        ] = up_weights[i]
-                        weight_index += split_dims[i]
-
-                    new_lora_name = lora_name_prefix + "_qkv"
-                    state_dict[f"{new_lora_name}.lora_down.weight"] = down_weight
-                    state_dict[f"{new_lora_name}.lora_up.weight"] = up_weight
-
-                    # adjust alpha because rank is 3x larger. See https://github.com/kohya-ss/sd-scripts/issues/2204
-                    state_dict[f"{new_lora_name}.alpha"] = alpha * 3
-
-                    qkv_count += 1
-
-            if count == 0 and qkv_count == 0:
-                logger.warning(
-                    "This LoRA does not need to converted to ComfyUI format."
-                )
-            else:
-                logger.info(f"Direct key renames applied: {count}")
-                logger.info(f"QKV LoRA layers processed: {qkv_count}")
-                logger.info("Convert LoRA to ComfyUI format successfully.")
+        state_dict = comfy.utils.load_torch_file(lora_path, safe_load=True)
+        
+        logger.info(
+            "Start Converting Musubi Tuner LoRA to ComfyUI Compatible Format..."
+        )
+        
+        prefix = "lora_unet_"
+        state_dict = convert_to_diffusers(prefix, None, state_dict)
 
         model_lora, clip_lora = comfy.sd.load_lora_for_models(
             model, None, state_dict, strength_model, None

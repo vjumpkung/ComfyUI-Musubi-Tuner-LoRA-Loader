@@ -4,38 +4,59 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a ComfyUI custom node that enables loading musubi-tuner based LoRAs (such as Z-Image Turbo and Hunyuan Video 1.5) directly without requiring manual conversion to ComfyUI format. The conversion happens on-the-fly in memory during node execution.
+This is a ComfyUI custom node built with the v3 Schema API that enables loading musubi-tuner based LoRAs (including Qwen-Image, Z-Image Turbo, Hunyuan Video 1.5, FLUX, and Wan2.1) directly without requiring manual conversion to ComfyUI format. The conversion to diffusers-compatible format happens on-the-fly in memory during node execution.
 
 ## Architecture
 
 ### Core Components
 
 **nodes.py** - Contains the main node implementation:
-- `MusubiTunerLoRALoaderModelOnly`: Extends ComfyUI's built-in `LoraLoaderModelOnly` class
-- Performs runtime conversion of musubi-tuner LoRA format to ComfyUI-compatible format
-- Implements two conversion strategies:
-  1. **Direct key renaming** - Handles layer naming differences between formats
-  2. **QKV concatenation** - Merges separate Q/K/V LoRA weights into unified QKV layers
+- `MusubiTunerLoRALoaderModelOnly`: Implements `io.ComfyNode` base class using ComfyUI v3 Schema API
+- `convert_to_diffusers()`: Main conversion function that transforms musubi-tuner LoRA format to diffusers-compatible format
+- `QWEN_IMAGE_KEYS`: Predefined list of Qwen-Image state dict keys for format detection
+- `MusubiTunerLoRALoaderExtension`: Extension class that implements `ComfyExtension` protocol
 
-**__init__.py** - Standard ComfyUI custom node entry point that exports `NODE_CLASS_MAPPINGS` and `NODE_DISPLAY_NAME_MAPPINGS`
+**__init__.py** - ComfyUI v3 extension entry point:
+- Imports and exports `comfy_entrypoint()` function
+- No longer uses legacy `NODE_CLASS_MAPPINGS` dictionary
 
 ### Conversion Logic
 
-The node handles two types of musubi-tuner LoRAs:
+The `convert_to_diffusers()` function handles multiple musubi-tuner LoRA formats through a three-stage process:
 
-1. **Z-Image Turbo** (uses `layers` namespace):
-   - Renames: `attention_to_out_0` → `attention_out`, `attention_norm_k` → `attention_k_norm`, `attention_norm_q` → `attention_q_norm`
-   - Merges `to_q`, `to_k`, `to_v` → `qkv` layers
+1. **Module Name Mapping**:
+   - **Qwen-Image**: Uses `QWEN_IMAGE_KEYS` predefined mappings for explicit key translation
+   - **Other formats**: Derives module names from LoRA names by replacing underscores with dots
+   - Applies format-specific pattern fixes:
+     - **Wan2.1**: `.cross.attn.` → `.cross_attn.`, `.self.attn.` → `.self_attn.`, `k.img` → `k_img`, `v.img` → `v_img`
+     - **Z-Image**: `.to.q` → `.to_q`, `.to.k` → `.to_k`, `.to.v` → `.to_v`, `.to.out` → `.to_out`, `.feed.forward` → `.feed_forward`
+     - **HunyuanVideo/FLUX**: `double.blocks.` → `double_blocks.`, `single.blocks.` → `single_blocks.`, `img.` → `img_`, `txt.` → `txt_`, `attn.` → `attn_`
 
-2. **Hunyuan Video 1.5** (uses `double_blocks` namespace):
-   - Renames: `img_mlp_fc1` → `img_mlp_0`, `img_mlp_fc2` → `img_mlp_2`, `img_mod_linear` → `img_mod_lin`, and corresponding `txt_*` variants
-   - Merges `_q`, `_k`, `_v` → `_qkv` layers
+2. **Weight Key Transformation**:
+   - Converts `lora_down` → `{diffusers_prefix}.{module_name}.lora_A.weight`
+   - Converts `lora_up` → `{diffusers_prefix}.{module_name}.lora_B.weight`
+   - Extracts dimension info from weight shapes (down: dim = shape[0], up: dim = shape[1])
 
-**QKV Merging Strategy**: The conversion concatenates separate Q/K/V LoRA down-weights and creates a sparse up-weight matrix. The alpha value is multiplied by 3 to account for the 3x larger rank (see kohya-ss/sd-scripts#2204).
+3. **Alpha Scaling**:
+   - Scales weights by `sqrt(alpha / dim)` to maintain proper magnitude
+   - Applies scaling to both lora_A and lora_B weights
+   - Warns if alpha value is missing for a LoRA layer
 
-### State Management
+### Node Execution Flow
 
-The node caches the converted LoRA state dict in `self.loaded_lora` as a tuple of `(lora_path, state_dict)` to avoid redundant conversions when the same LoRA is used multiple times.
+1. **Schema Definition** (`define_schema()`):
+   - Defines node inputs: `model` (Model), `lora_name` (Combo from folder_paths), `strength_model` (Float: -100.0 to 100.0, default 1.0)
+   - Defines single output: `model` (Model)
+   - Sets node metadata: ID, display name, category, description
+
+2. **Execution** (`execute()`):
+   - Returns immediately if `strength_model == 0` (optimization shortcut)
+   - Loads LoRA file using `comfy.utils.load_torch_file()` with safe loading
+   - Converts state dict using `convert_to_diffusers()` with `lora_unet_` prefix
+   - Applies LoRA to model using `comfy.sd.load_lora_for_models()`
+   - Returns modified model wrapped in `io.NodeOutput`
+
+Note: Conversion happens on every execution; there is no caching mechanism in the current implementation.
 
 ## Development
 
@@ -50,21 +71,27 @@ This custom node must be tested within a running ComfyUI instance:
 
 ### Dependencies
 
-- `torch` - For tensor operations during QKV merging
-- `tqdm` - Progress bar for QKV conversion loop
-- `comfy.sd` - ComfyUI's LoRA loading utilities
-- `comfy.utils` - SafeTensors file loading
-- `folder_paths` - ComfyUI's path resolution for model files
-- `nodes.LoraLoaderModelOnly` - Parent class from ComfyUI core
+- `torch` - For tensor operations and weight manipulation
+- `tqdm` - Progress bar for conversion loop
+- `comfy.sd` - ComfyUI's LoRA loading utilities (`load_lora_for_models`)
+- `comfy.utils` - SafeTensors file loading (`load_torch_file`)
+- `folder_paths` - ComfyUI's path resolution for LoRA files
+- `comfy_api.latest` - ComfyUI v3 Schema API (`ComfyExtension`, `io` module)
+- `logging` - Standard Python logging for info/warning messages
 
 ### Key Implementation Details
 
-- Conversion happens in `load_musubi_tuner_lora()` on first load, then cached
-- If `strength_model == 0`, the node short-circuits and returns the unmodified model
-- The state dict is modified in-place using `state_dict.pop()` and `state_dict[new_key] = ...`
-- Logging uses Python's standard `logging` module with INFO level by default
+- Node uses ComfyUI v3 Schema API with `io.ComfyNode` base class
+- Schema definition is declarative using `io.Schema()` with typed inputs/outputs
+- Conversion happens in `convert_to_diffusers()` on every execution (no caching)
+- If `strength_model == 0`, the node short-circuits and returns the unmodified model wrapped in `io.NodeOutput`
+- State dict is built as a new dictionary (`new_weights_sd = {}`), original is not mutated
+- Alpha values are extracted first, then applied during weight conversion
+- Logging uses Python's standard `logging` module with INFO level for conversion start and WARNING for missing alphas
+- Progress bar via `tqdm` shows processing of each key during conversion
+- Extension registration uses async `comfy_entrypoint()` function returning `ComfyExtension` instance
 - All conversions preserve tensor device and dtype
 
 ## Credits
 
-Conversion logic adapted from: https://github.com/kohya-ss/musubi-tuner/blob/main/src/musubi_tuner/networks/lora_zimage.py
+Conversion logic adapted from: https://github.com/kohya-ss/musubi-tuner/blob/main/src/musubi_tuner/convert_lora.py

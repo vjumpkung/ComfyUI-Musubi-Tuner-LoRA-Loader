@@ -75,12 +75,13 @@ def convert_to_diffusers(prefix, diffusers_prefix, weights_sd):
                 lora_alphas[lora_name] = weight
 
     new_weights_sd = {}
+    estimated_type = None
     for key, weight in tqdm(weights_sd.items(), desc="Processing QKV layers"):
         if key.startswith(prefix):
             if "alpha" in key:
                 continue
 
-            lora_name = key.split(".", 1)[0]  # before first dot
+            lora_name, weight_name = key.split(".", 1)
 
             if lora_name in lora_name_to_module_name:
                 module_name = lora_name_to_module_name[lora_name]
@@ -118,27 +119,44 @@ def convert_to_diffusers(prefix, diffusers_prefix, weights_sd):
                     module_name = module_name.replace("txt.", "txt_")  # fix txt
                     module_name = module_name.replace("attn.", "attn_")  # fix attn
 
+            dim = None  # None means LoHa or LoKr, otherwise it's LoRA with alpha and dim is used for scaling
             if "lora_down" in key:
                 new_key = f"{diffusers_prefix}.{module_name}.lora_A.weight"
                 dim = weight.shape[0]
             elif "lora_up" in key:
                 new_key = f"{diffusers_prefix}.{module_name}.lora_B.weight"
                 dim = weight.shape[1]
+            elif "hada" in key or "lokr" in key:  # LoHa or LoKr
+                new_key = f"{diffusers_prefix}.{module_name}.{weight_name}"
+                if "hada" in key:
+                    estimated_type = "LoHa"
+                elif "lokr" in key:
+                    estimated_type = "LoKr"
             else:
                 logger.warning(f"unexpected key: {key} in default LoRA format")
                 continue
+            if dim is not None:
+                estimated_type = "LoRA"
 
-            # scale weight by alpha
-            if lora_name in lora_alphas:
+            # scale weight by alpha for LoRA with alpha (e.g., LyCORIS), to match Diffusers format which has no alpha (alpha is effectively 1)
+            if lora_name in lora_alphas and dim is not None:
                 # we scale both down and up, so scale is sqrt
                 scale = lora_alphas[lora_name] / dim
                 scale = scale.sqrt()
                 weight = weight * scale
             else:
-                logger.warning(f"missing alpha for {lora_name}")
+                if dim is not None:
+                    logger.warning(f"missing alpha for {lora_name}")
+                else:
+                    # for LoHa or LoKr, we copy alpha if exists
+                    if lora_name in lora_alphas:
+                        new_weights_sd[f"{diffusers_prefix}.{module_name}.alpha"] = (
+                            lora_alphas[lora_name]
+                        )
 
             new_weights_sd[new_key] = weight
 
+    logger.info(f"estimated type: {estimated_type}")
     return new_weights_sd
 
 
@@ -173,11 +191,11 @@ class MusubiTunerLoRALoaderModelOnly(io.ComfyNode):
 
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         state_dict = comfy.utils.load_torch_file(lora_path, safe_load=True)
-        
+
         logger.info(
             "Start Converting Musubi Tuner LoRA to ComfyUI Compatible Format..."
         )
-        
+
         prefix = "lora_unet_"
         state_dict = convert_to_diffusers(prefix, None, state_dict)
 
